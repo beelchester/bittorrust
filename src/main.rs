@@ -111,6 +111,8 @@ async fn download_piece(
     piece_index: u32,
     piece_length: u32,
     current_block_tasks: Arc<Mutex<HashSet<u64>>>,
+    piece_hash: String,
+    whole_file_buf: Option<Arc<Mutex<HashMap<u32, Vec<u8>>>>>,
 ) {
     println!("***** started piece download {}", piece_index);
     // sending peer details request
@@ -148,25 +150,47 @@ async fn download_piece(
     for task in tasks {
         task.await.unwrap();
     }
-    let piece_data = download_piece_buf.lock().await;
+    let block_data_hashmap = download_piece_buf.lock().await;
+    let mut piece_data_buf = Vec::with_capacity(piece_length.try_into().unwrap());
     let mut o = 0;
     loop {
         if o == block_index {
             break;
         }
-        let data = piece_data.get(&o).unwrap();
-        let output_path = format!("test-piece-{}", piece_index);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(output_path)
-            .await
-            .expect("Failed to open file");
-
-        file.write_all(data).await.expect("Failed to write to file");
+        let block_data = block_data_hashmap.get(&o).unwrap();
+        piece_data_buf.extend(block_data);
+        println!(
+            "********* len of piece {piece_index} buf is {:?}",
+            piece_data_buf.len()
+        );
         o += 1;
     }
-    println!("file written from piece");
+    let piece_buf_hash = Sha1::digest(piece_data_buf.clone());
+    assert_eq!(
+        piece_hash,
+        hex::encode(piece_buf_hash), //NOTE: not sure if comparing hex values of hashes is good
+        "integrity of piece {piece_index} failed"
+    );
+    match whole_file_buf {
+        Some(buf) => {
+            let mut b = buf.lock().await;
+            b.insert(piece_index, piece_data_buf);
+        }
+        None => {
+            let output_path = format!("test-piece-{}", piece_index);
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(output_path)
+                .await
+                .expect("failed to open file");
+
+            file.write_all(&piece_data_buf)
+                .await
+                .expect("failed to write to file");
+            println!("file written from piece");
+        }
+    }
 }
 
 #[tokio::main]
@@ -186,8 +210,9 @@ async fn main() -> Result<(), ()> {
     println!("tracker url {:?}", decoded.announce);
     println!("total pieces {:?}", decoded.info.pieces.len());
     println!("piece hashes:");
+    let mut piece_hashes = Vec::new();
     for hash in decoded.info.pieces.chunks(20) {
-        println!("{:?}", hex::encode(hash));
+        piece_hashes.push(hex::encode(hash));
     }
     let info_hash_encoded = encode_binary(&info_hash).into_owned();
     println!("{}", info_hash_encoded);
@@ -299,18 +324,19 @@ async fn main() -> Result<(), ()> {
             unchoke_buf[4]
         );
     }
-    let mut i = 0;
+    let mut piece_index = 0;
     let mut total_len = 0;
     let file_len: u32 = decoded.info.length.unwrap() as u32;
     let total_pieces = decoded.info.pieces.len() / 20;
     let p_size = decoded.info.piece_length;
     let pending_tasks: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
     let stream: Arc<Mutex<TcpStream>> = Arc::new(Mutex::new(stream));
+    let whole_file_buf_lock = Arc::new(Mutex::new(HashMap::new()));
 
     let mut ptasks = vec![];
     loop {
-        println!("i set to {} tp is {}", i, total_pieces);
-        if i == (total_pieces as u32) {
+        println!("i set to {} tp is {}", piece_index, total_pieces);
+        if piece_index == (total_pieces as u32) {
             break;
         }
         total_len += p_size;
@@ -321,20 +347,45 @@ async fn main() -> Result<(), ()> {
             p_size
         };
         println!("fl set to {} tl is {}", file_len, total_len);
+        let piece_hash = piece_hashes.get(piece_index as usize).unwrap();
         let ptask = task::spawn(download_piece(
             Arc::clone(&stream),
-            i,
+            piece_index,
             temp_file_len as u32,
             pending_tasks.clone(),
+            piece_hash.to_string(),
+            Some(whole_file_buf_lock.clone()),
         ));
-        println!("pushed task {}", i);
+        println!("pushed task {}", piece_index);
         ptasks.push(ptask);
 
-        i += 1;
+        piece_index += 1;
     }
     for ptask in ptasks {
         ptask.await.unwrap();
     }
 
+    let mut temp = 0;
+    loop {
+        if temp == piece_index {
+            break;
+        }
+        let whole_file_buf = whole_file_buf_lock.lock().await;
+        if whole_file_buf.len() > 0 {
+            let output_path = format!("whole_file.txt");
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(output_path)
+                .await
+                .expect("failed to open file");
+            let p_buf = &whole_file_buf.get(&temp).unwrap();
+            file.write_all(p_buf)
+                .await
+                .expect("failed to write to file");
+            println!("file written from piece");
+            temp += 1;
+        };
+    }
     Ok(())
 }
