@@ -2,9 +2,7 @@ use sha1::{Digest, Sha1};
 use std::{
     collections::{HashMap, HashSet},
     net::{Ipv4Addr, SocketAddrV4},
-    sync::{Arc, RwLockReadGuard},
-    time::Duration,
-    usize,
+    sync::Arc,
 };
 use tokio::{
     fs::{File, OpenOptions},
@@ -19,7 +17,7 @@ use urlencoding::encode_binary;
 mod torrent;
 use torrent::Torrent;
 
-use crate::torrent::{TrackerRequest, TrackerResponse};
+use crate::torrent::TrackerResponse;
 
 const MAX_CONCURRENT_REQUESTS: usize = 5;
 const DEFAULT_BLOCK_LENGTH: u32 = 16 * 1024;
@@ -42,6 +40,7 @@ async fn handshake(addr: SocketAddrV4, info_hash: [u8; 20]) -> TcpStream {
     stream
 }
 
+//TODO: refactor arguments
 async fn request_block(
     stream: Arc<Mutex<TcpStream>>,
     piece_index: u32,
@@ -49,12 +48,14 @@ async fn request_block(
     offset: u32,
     block_task_id: u64,
     current_block_tasks: Arc<Mutex<HashSet<u64>>>,
+    download_piece_buf: Arc<Mutex<HashMap<u32, Vec<u8>>>>,
+    block_index: u32,
 ) {
     println!(
         "--------------- started b {}, for {}",
         block_task_id, piece_index
     );
-    // if block_task_id == 1 {
+    // if block_index == 0 {
     //     println!("huge sleep for b {}", block_task_id);
     //     sleep(tokio::time::Duration::from_millis(1000)).await;
     // }
@@ -69,7 +70,6 @@ async fn request_block(
         piece_length - offset
     };
     println!("final b {}", block_length);
-    let mut piece_data_buf = Vec::with_capacity(block_length as usize);
     let mut request_message = vec![0; 17];
     request_message[0..4].copy_from_slice(&(13u32.to_be_bytes()));
     request_message[4] = 6;
@@ -92,20 +92,9 @@ async fn request_block(
     println!("bl len is {:?}", block_data.len());
     println!("off is {}", offset);
 
-    piece_data_buf.extend_from_slice(&block_data);
-    println!("pd len is {:?}", piece_data_buf.len());
-
-    let output_path = format!("test-piece-{}", piece_index);
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(output_path)
-        .await
-        .expect("Failed to open file");
-
-    file.write_all(&block_data)
-        .await
-        .expect("Failed to write to file");
+    let mut d_buf = download_piece_buf.lock().await;
+    d_buf.insert(block_index, block_data);
+    println!("dp of {piece_index} is {:?}", d_buf.len());
 
     let mut temp_current_block_tasks = current_block_tasks.lock().await;
     println!("pending tasks: {:?}", temp_current_block_tasks);
@@ -128,6 +117,8 @@ async fn download_piece(
     // dividing pieces into blocks
     let mut offset: u32 = 0;
     let mut tasks = vec![];
+    let download_piece_buf = Arc::new(Mutex::new(HashMap::new()));
+    let mut block_index = 0;
 
     while offset < piece_length {
         let block_task_id = rand::random();
@@ -147,13 +138,35 @@ async fn download_piece(
             offset,
             block_task_id,
             current_block_tasks.clone(),
+            download_piece_buf.clone(),
+            block_index,
         ));
         tasks.push(task);
         offset += DEFAULT_BLOCK_LENGTH;
+        block_index += 1;
     }
     for task in tasks {
         task.await.unwrap();
     }
+    let piece_data = download_piece_buf.lock().await;
+    let mut o = 0;
+    loop {
+        if o == block_index {
+            break;
+        }
+        let data = piece_data.get(&o).unwrap();
+        let output_path = format!("test-piece-{}", piece_index);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(output_path)
+            .await
+            .expect("Failed to open file");
+
+        file.write_all(data).await.expect("Failed to write to file");
+        o += 1;
+    }
+    println!("file written from piece");
 }
 
 #[tokio::main]
@@ -187,16 +200,16 @@ async fn main() -> Result<(), ()> {
     let left = decoded.info.length.unwrap();
     let compact = 1;
 
-    let req = TrackerRequest {
-        info_hash: info_hash.into(),
-        peer_id: peer_id.into(),
-        port,
-        uploaded,
-        downloaded,
-        left,
-        compact,
-    };
-
+    // let req = TrackerRequest {
+    //     info_hash: info_hash.into(),
+    //     peer_id: peer_id.into(),
+    //     port,
+    //     uploaded,
+    //     downloaded,
+    //     left,
+    //     compact,
+    // };
+    //
     let mut params = HashMap::new();
 
     // Define other parameters
@@ -293,7 +306,6 @@ async fn main() -> Result<(), ()> {
     let p_size = decoded.info.piece_length;
     let pending_tasks: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
     let stream: Arc<Mutex<TcpStream>> = Arc::new(Mutex::new(stream));
-    let clone = pending_tasks.clone();
 
     let mut ptasks = vec![];
     loop {
