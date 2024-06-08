@@ -1,9 +1,54 @@
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
+use sha1::{Digest, Sha1};
+use tokio::{fs::File, io::AsyncReadExt};
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Torrent {
+    /// URL of the tracker
+    pub announce: String,
+    /// Information about the file(s) being shared
+    pub info: Info,
+    /// List of lists of URLs
+    /// If available, then `announce` is ignored
+    /// [spec](http://bittorrent.org/beps/bep_0012.html)
+    #[serde(default)]
+    #[serde(rename = "announce-list")]
+    pub announce_list: Option<Vec<Vec<String>>>,
+    /// Comment about the torrent by the creator
+    #[serde(default)]
+    pub comment: Option<String>,
+    /// Name and version of the program used to create the .torrent
+    #[serde(default)]
+    #[serde(rename = "created by")]
+    pub created_by: Option<String>,
+    /// Creation date of the torrent
+    #[serde(default)]
+    #[serde(rename = "creation date")]
+    pub creation_date: Option<u64>,
+    /// Encoding used for the fields in the torrent
+    #[serde(default)]
+    pub encoding: Option<String>,
+}
+
+impl Torrent {
+    pub async fn new(file: &str) -> Torrent {
+        let file = File::open(file).await.unwrap();
+        let mut buf_reader = tokio::io::BufReader::new(file);
+        let mut bytes = Vec::new();
+        buf_reader.read_to_end(&mut bytes).await.unwrap();
+        serde_bencode::from_bytes::<Torrent>(&bytes).unwrap()
+    }
+    pub fn info_hash(&self) -> [u8; 20] {
+        let bencoded_info = serde_bencode::to_bytes(&self.info).unwrap();
+        let info_hash = Sha1::digest(bencoded_info.clone());
+        info_hash.into()
+    }
+}
 
 #[allow(dead_code)]
 #[derive(Debug, Deserialize, Clone, Serialize)]
-pub struct File {
+pub struct TorrentFile {
     /// Path of the file, as a list of strings
     pub path: Vec<String>,
     /// Length of the file in bytes
@@ -36,62 +81,10 @@ pub struct Info {
     #[serde(default)]
     /// Multi-file:
     /// List of files
-    pub files: Option<Vec<File>>,
+    pub files: Option<Vec<TorrentFile>>,
     // #[serde(default)]
     // pub path: Option<Vec<String>>,
     // #[serde(default)]
     // #[serde(rename = "root hash")]
     // pub root_hash: Option<String>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Torrent {
-    /// URL of the tracker
-    pub announce: String,
-    /// Information about the file(s) being shared
-    pub info: Info,
-    /// List of lists of URLs
-    /// If available, then `announce` is ignored
-    /// [spec](http://bittorrent.org/beps/bep_0012.html)
-    #[serde(default)]
-    #[serde(rename = "announce-list")]
-    pub announce_list: Option<Vec<Vec<String>>>,
-    /// Comment about the torrent by the creator
-    #[serde(default)]
-    pub comment: Option<String>,
-    /// Name and version of the program used to create the .torrent
-    #[serde(default)]
-    #[serde(rename = "created by")]
-    pub created_by: Option<String>,
-    /// Creation date of the torrent
-    #[serde(default)]
-    #[serde(rename = "creation date")]
-    pub creation_date: Option<u64>,
-    /// Encoding used for the fields in the torrent
-    #[serde(default)]
-    pub encoding: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct TrackerResponse {
-    pub interval: u64,
-    pub peers: ByteBuf,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Peer {
-    pub ip: String,
-    pub port: u64,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct TrackerRequest {
-    pub info_hash: [u8; 20],
-    pub peer_id: String,
-    pub port: u16,
-    pub uploaded: usize,
-    pub downloaded: usize,
-    pub left: usize,
-    pub compact: u8,
 }
