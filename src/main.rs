@@ -1,49 +1,131 @@
 use anyhow::Result;
 use bittorrust::{peer::Peer, torrent::Torrent, tracker::TrackerRequest};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use clap::{command, Parser, Subcommand};
+use std::{
+    collections::HashSet,
+    net::{Ipv4Addr, SocketAddrV4},
+    path::PathBuf,
+    sync::Arc,
+};
+use tokio::{stream, sync::Mutex};
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+#[clap(rename_all = "snake_case")]
+enum Command {
+    Decode {
+        value: String,
+    },
+    Info {
+        torrent: PathBuf,
+    },
+    Peers {
+        torrent: PathBuf,
+    },
+    Handshake {
+        torrent: PathBuf,
+        // peer: String,
+    },
+    DownloadPiece {
+        #[arg(short)]
+        output: PathBuf,
+        torrent: PathBuf,
+        piece: u32,
+    },
+    Download {
+        #[arg(short)]
+        output: PathBuf,
+        torrent: PathBuf,
+    },
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let decoded_torrent = Torrent::new("sample.torrent").await;
-    let info_hash = decoded_torrent.info_hash();
-    let mut piece_hashes = Vec::new();
-    for hash in decoded_torrent.info.pieces.chunks(20) {
-        piece_hashes.push(hex::encode(hash));
-    }
+    let args = Args::parse();
 
-    let peer_id = "00112233445566778899";
-    let port = 6881;
-    let uploaded = 0;
-    let downloaded = 0;
-    let left = decoded_torrent.info.length.unwrap();
-    let compact = 1;
-
-    let req = TrackerRequest {
-        info_hash,
-        peer_id: peer_id.into(),
-        port,
-        uploaded,
-        downloaded,
-        left,
-        compact,
+    match args.command {
+        Command::Decode { value } => {
+            let (decoded, _) = bittorrust::bencode_parser::decode(&value);
+            println!("{}", decoded);
+        }
+        Command::Info { torrent } => {
+            let decoded_torrent = Torrent::new(torrent).await;
+            println!("Tracker URL: {}", decoded_torrent.announce);
+            println!("Length: {}", decoded_torrent.info.length.unwrap());
+            let info_hash = decoded_torrent.info_hash();
+            println!("Info Hash: {}", hex::encode(info_hash));
+            println!("Piece Length: {}", decoded_torrent.info.piece_length);
+            println!("Piece Hashes: {:?}", decoded_torrent.get_piece_hashes());
+        }
+        Command::Peers { torrent } => {
+            let decoded_torrent = Torrent::new(torrent).await;
+            let info_hash = decoded_torrent.info_hash();
+            let info_hash_url = TrackerRequest::url_encode(info_hash);
+            let req = TrackerRequest::new(&decoded_torrent, info_hash);
+            let tracker_response =
+                TrackerRequest::request(&req, info_hash_url, &decoded_torrent.announce).await;
+            let peers = tracker_response.get_peers();
+            println!("peers: {:?}", peers);
+        }
+        Command::Handshake { torrent } => {
+            //TODO: get peer socket from args
+            // $ ./your_bittorrent.sh handshake sample.torrent <peer_ip>:<peer_port>
+            let decoded_torrent = Torrent::new(torrent).await;
+            let info_hash = decoded_torrent.info_hash();
+            let info_hash_url = TrackerRequest::url_encode(info_hash);
+            let req = TrackerRequest::new(&decoded_torrent, info_hash);
+            let tracker_response =
+                TrackerRequest::request(&req, info_hash_url, &decoded_torrent.announce).await;
+            let peers = tracker_response.get_peers();
+            let peer = Peer { socket: peers[0] };
+            let _ = Peer::handshake(peer, info_hash).await;
+        }
+        Command::DownloadPiece {
+            output,
+            torrent,
+            piece,
+        } => {
+            let decoded_torrent = Torrent::new(torrent).await;
+            let info_hash = decoded_torrent.info_hash();
+            let info_hash_url = TrackerRequest::url_encode(info_hash);
+            let piece_hashes = decoded_torrent.get_piece_hashes();
+            let req = TrackerRequest::new(&decoded_torrent, info_hash);
+            let tracker_response =
+                TrackerRequest::request(&req, info_hash_url, &decoded_torrent.announce).await;
+            let peers = tracker_response.get_peers();
+            let peer = Peer { socket: peers[0] };
+            let stream = Arc::new(Mutex::new(Peer::handshake(peer, info_hash).await));
+            let pending_tasks: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
+            Peer::download_piece(
+                stream,
+                piece,
+                decoded_torrent.info.piece_length,
+                pending_tasks,
+                piece_hashes.get(piece as usize).unwrap().to_string(),
+                None,
+                output,
+            )
+            .await;
+        }
+        Command::Download { output, torrent } => {
+            let decoded_torrent = Torrent::new(torrent).await;
+            let info_hash = decoded_torrent.info_hash();
+            let piece_hashes = decoded_torrent.get_piece_hashes();
+            let req = TrackerRequest::new(&decoded_torrent, info_hash);
+            let info_hash_url = TrackerRequest::url_encode(info_hash);
+            let tracker_response =
+                TrackerRequest::request(&req, info_hash_url, &decoded_torrent.announce).await;
+            let peers = tracker_response.get_peers();
+            let peer = Peer { socket: peers[0] };
+            let stream = Peer::handshake(peer, info_hash).await;
+            Peer::download_torrent(stream, decoded_torrent, piece_hashes, output, None).await;
+        }
     };
-
-    let info_hash_url = TrackerRequest::url_encode(info_hash);
-    let tracker_response =
-        TrackerRequest::request(&req, info_hash_url, &decoded_torrent.announce).await;
-    let peers = tracker_response
-        .peers
-        .chunks(6)
-        .map(|chunk| {
-            let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
-            let port = u16::from_be_bytes([chunk[4], chunk[5]]);
-            SocketAddrV4::new(ip, port)
-        })
-        .collect::<Vec<_>>();
-    let peer = Peer { socket: peers[0] };
-    let stream = Peer::handshake(peer, info_hash).await;
-
-    // Downloading a piece
-    Peer::download_torrent(stream, decoded_torrent, piece_hashes).await;
     Ok(())
 }

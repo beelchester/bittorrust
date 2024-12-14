@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use sha1::{Digest, Sha1};
@@ -32,7 +34,7 @@ pub struct Torrent {
 }
 
 impl Torrent {
-    pub async fn new(file: &str) -> Torrent {
+    pub async fn new(file: PathBuf) -> Torrent {
         let file = File::open(file).await.unwrap();
         let mut buf_reader = tokio::io::BufReader::new(file);
         let mut bytes = Vec::new();
@@ -43,6 +45,13 @@ impl Torrent {
         let bencoded_info = serde_bencode::to_bytes(&self.info).unwrap();
         let info_hash = Sha1::digest(bencoded_info.clone());
         info_hash.into()
+    }
+    pub fn get_piece_hashes(&self) -> Vec<String> {
+        let mut piece_hashes = Vec::new();
+        for hash in self.info.pieces.chunks(20) {
+            piece_hashes.push(hex::encode(hash));
+        }
+        piece_hashes
     }
 }
 

@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddrV4,
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -66,18 +67,18 @@ impl Peer {
         let mut piece_header = vec![0; 13];
         stream.read_exact(&mut piece_header).await.unwrap();
         println!(
-            "ph is {:?}",
+            "ph: {:?}",
             u32::from_be_bytes(piece_header[0..4].try_into().unwrap())
         );
         assert_eq!(piece_header[4], 7);
         let mut block_data = vec![0; block_length as usize];
         stream.read_exact(&mut block_data).await.unwrap();
-        println!("bl len is {:?}", block_data.len());
-        println!("off is {}", offset);
+        println!("bl len: {:?}", block_data.len());
+        println!("off: {}", offset);
 
         let mut d_buf = download_piece_buf.lock().await;
         d_buf.insert(block_index, block_data);
-        println!("dp of {piece_index} is {:?}", d_buf.len());
+        println!("dp of {piece_index}: {:?}", d_buf.len());
 
         let mut temp_current_block_tasks = current_block_tasks.lock().await;
         println!("pending tasks: {:?}", temp_current_block_tasks);
@@ -89,13 +90,14 @@ impl Peer {
         );
     }
 
-    async fn download_piece(
+    pub async fn download_piece(
         stream: Arc<Mutex<TcpStream>>,
         piece_index: u32,
         piece_length: u32,
         current_block_tasks: Arc<Mutex<HashSet<u64>>>,
         piece_hash: String,
         whole_file_buf: Option<Arc<Mutex<HashMap<u32, Vec<u8>>>>>,
+        output_path: PathBuf,
     ) {
         println!("***** started piece download {}", piece_index);
         // sending peer details request
@@ -143,7 +145,7 @@ impl Peer {
             let block_data = block_data_hashmap.get(&o).unwrap();
             piece_data_buf.extend(block_data);
             println!(
-                "********* len of piece {piece_index} buf is {:?}",
+                "********* len of piece {piece_index} buf: {:?}",
                 piece_data_buf.len()
             );
             o += 1;
@@ -160,7 +162,6 @@ impl Peer {
                 b.insert(piece_index, piece_data_buf);
             }
             None => {
-                let output_path = format!("test-piece-{}", piece_index);
                 let mut file = OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -196,6 +197,8 @@ impl Peer {
         mut stream: TcpStream,
         torrent: Torrent,
         piece_hashes: Vec<String>,
+        output_path: PathBuf,
+        only_piece: Option<u32>,
     ) {
         // getting the bitfield
         // getting bitfield message prefix that indicates the total size of the bitfield message
@@ -204,7 +207,7 @@ impl Peer {
         stream.read_exact(&mut bitfield_len_buf).await.unwrap();
         let bf = u32::from_be_bytes(bitfield_len_buf) as usize;
         println!("bitfield len gave {}", bf);
-        println!("bitfield len buf is {:?}", bitfield_len_buf);
+        println!("bitfield len buf: {:?}", bitfield_len_buf);
 
         if bf == 0 {
             println!("No bitfield message received.");
@@ -214,7 +217,7 @@ impl Peer {
 
         let mut bitfield_msg_buf = vec![0; bf];
         stream.read_exact(&mut bitfield_msg_buf).await.unwrap();
-        println!("bitfield msg buf is {:?}", bitfield_msg_buf);
+        println!("bitfield msg buf: {:?}", bitfield_msg_buf);
         if bitfield_msg_buf[0] != 5 {
             panic!(
                 "Expected bitfield message, but got message ID: {}",
@@ -231,14 +234,14 @@ impl Peer {
 
         let mut unchoke_buf = vec![0; 5];
         stream.read_exact(&mut unchoke_buf).await.unwrap();
-        println!("unchoke msg buf is {:?}", unchoke_buf);
+        println!("unchoke msg buf: {:?}", unchoke_buf);
         if unchoke_buf[4] != 1 {
             panic!(
                 "Expected unchoke message, but got message ID: {}",
                 unchoke_buf[4]
             );
         }
-        let mut piece_index = 0;
+        let mut piece_index = only_piece.unwrap_or_default();
         let mut total_len = 0;
         let file_len: u32 = torrent.info.length.unwrap() as u32;
         let total_pieces = torrent.info.pieces.len() / 20;
@@ -249,7 +252,7 @@ impl Peer {
 
         let mut ptasks = vec![];
         loop {
-            println!("i set to {} tp is {}", piece_index, total_pieces);
+            println!("i set to {} tp: {}", piece_index, total_pieces);
             if piece_index == (total_pieces as u32) {
                 break;
             }
@@ -260,7 +263,7 @@ impl Peer {
             } else {
                 p_size
             };
-            println!("fl set to {} tl is {}", file_len, total_len);
+            println!("fl set to {} tl: {}", file_len, total_len);
             let piece_hash = piece_hashes.get(piece_index as usize).unwrap();
             let ptask = task::spawn(Self::download_piece(
                 Arc::clone(&stream),
@@ -268,7 +271,12 @@ impl Peer {
                 temp_file_len,
                 pending_tasks.clone(),
                 piece_hash.to_string(),
-                Some(whole_file_buf_lock.clone()),
+                if only_piece.is_some() {
+                    None
+                } else {
+                    Some(whole_file_buf_lock.clone())
+                },
+                output_path.clone(),
             ));
             println!("pushed task {}", piece_index);
             ptasks.push(ptask);
@@ -286,11 +294,10 @@ impl Peer {
             }
             let whole_file_buf = whole_file_buf_lock.lock().await;
             if whole_file_buf.len() > 0 {
-                let output_path = torrent.info.name.to_string();
                 let mut file = OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open(output_path)
+                    .open(&output_path)
                     .await
                     .expect("failed to open file");
                 let p_buf = &whole_file_buf.get(&temp).unwrap();
